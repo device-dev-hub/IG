@@ -47,7 +47,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-BOT_TOKEN = "7595465023:AAHz9L8E_Xl2XD88Abn4jCuSzm_MnoY6Hus"
+BOT_TOKEN = "7595465023:AAHzrqvV1fd-uxP2OsDigtDnbAVAvpoI9z4"
 
 USERS_DIR = Path("users")
 USERS_DIR.mkdir(exist_ok=True)
@@ -267,7 +267,7 @@ class InstagramAccount:
     async def login_async(self, verification_code: Optional[str] = None) -> tuple:
         try:
             page = await self._get_page()
-            await page.goto('https://www.instagram.com/accounts/login/', wait_until='networkidle')
+            await page.goto('https://www.instagram.com/accounts/login/', wait_until='domcontentloaded', timeout=30000)
             await asyncio.sleep(2)
 
             await page.fill('input[name="username"]', self.username)
@@ -340,11 +340,93 @@ class InstagramAccount:
 
             page = await self._get_page()
             await page.goto('https://www.instagram.com/', wait_until='domcontentloaded', timeout=30000)
-            await asyncio.sleep(1)
+            await asyncio.sleep(2)
+
+            # Check if redirected to login (invalid session)
+            if 'accounts/login' in page.url:
+                return False, "Invalid session ID - redirected to login"
+
+            username_found = None
+
+            # Strategy 1: Extract from profile link href
+            try:
+                profile_links = [
+                    'a[href*="/"]:has-text("[aria-label*="profile"])',
+                    'a[role="menuitem"]',
+                    'a[href^="/"]',
+                ]
+                for selector in profile_links:
+                    try:
+                        links = await page.query_selector_all(selector)
+                        for link in links:
+                            href = await link.get_attribute('href')
+                            if href and href.startswith('/'):
+                                potential_username = href.strip('/').split('/')[0]
+                                if potential_username and potential_username not in ['direct', 'explore', 'reels', 'create', 'search', 'p']:
+                                    username_found = potential_username
+                                    break
+                        if username_found:
+                            break
+                    except:
+                        continue
+            except:
+                pass
+
+            # Strategy 2: Extract from page HTML content
+            if not username_found:
+                try:
+                    page_content = await page.content()
+                    # Look for various username patterns in Instagram's JSON data
+                    patterns = [
+                        r'"username":"([^"]{1,30})"',
+                        r'username["\']?\s*:\s*["\']([^"\']{1,30})["\']',
+                        r'logged_in_user["\']?\s*:\s*\{[^}]*["\']username["\']?\s*:\s*["\']([^"\']{1,30})["\']',
+                    ]
+                    for pattern in patterns:
+                        match = re.search(pattern, page_content)
+                        if match:
+                            username_found = match.group(1)
+                            break
+                except:
+                    pass
+
+            # Strategy 3: Use GraphQL query
+            if not username_found:
+                try:
+                    # Try to get viewer info via GraphQL
+                    await page.goto('https://www.instagram.com/', wait_until='domcontentloaded', timeout=10000)
+                    await asyncio.sleep(1)
+                    viewer_data = await page.evaluate('''
+                        () => {
+                            const scripts = document.querySelectorAll('script');
+                            for (let script of scripts) {
+                                if (script.textContent.includes('viewer')) {
+                                    try {
+                                        const data = JSON.parse(script.textContent.match(/\{.*"viewer".*\}/)[0]);
+                                        return data.viewer?.username || null;
+                                    } catch (e) { }
+                                }
+                            }
+                            return null;
+                        }
+                    ''')
+                    if viewer_data:
+                        username_found = viewer_data
+                except:
+                    pass
+
+            if username_found:
+                self.username = username_found
+            else:
+                # Default fallback
+                self.username = "session_user"
 
             await self._save_cookies()
             with open(self.session_file, 'w') as f:
                 json.dump({'session_id': session_id, 'username': self.username}, f)
+
+            if self.username == "session_user" or not self.username:
+                return False, "Could not extract username from session - using fallback"
 
             return True, f"Logged in as @{self.username}"
         except Exception as e:
@@ -376,21 +458,109 @@ class InstagramAccount:
 
     async def get_direct_threads_async(self, amount: int = 10) -> List[Any]:
         try:
+            # Ensure session is set
+            context = await self._get_browser_context()
+            if self.session_id:
+                await context.add_cookies([{
+                    'name': 'sessionid',
+                    'value': self.session_id,
+                    'domain': '.instagram.com',
+                    'path': '/'
+                }])
+
             page = await self._get_page()
-            await page.goto('https://www.instagram.com/direct/inbox/', wait_until='networkidle')
+            await page.goto('https://www.instagram.com/direct/inbox/', wait_until='domcontentloaded', timeout=30000)
             await asyncio.sleep(2)
 
-            threads = await page.query_selector_all('div[role="listitem"]')
-            result = []
-            for i, thread in enumerate(threads[:amount]):
+            # Check if redirected to login
+            if 'accounts/login' in page.url:
+                logger.error("Not logged in - redirected to login page")
+                return []
+
+            # Try multiple selectors for thread list items with better coverage
+            thread_selectors = [
+                'a[href*="/direct/t/"]',  # Direct thread links
+                'div[role="listitem"]',   # List items
+                'div[class*="xdl72v0"]',  # Thread container
+                'div[class*="x1n2onr6"]', # Instagram layout class
+                'button:has-text("[direct]")',  # Button-based threads
+            ]
+
+            threads = []
+            for selector in thread_selectors:
                 try:
+                    elements = await page.query_selector_all(selector)
+                    if elements and len(elements) > 0:
+                        threads = elements
+                        break
+                except:
+                    continue
+
+            result = []
+            processed_ids = set()
+
+            for i, thread in enumerate(threads[:amount * 2]):  # Get more and filter duplicates
+                try:
+                    # Try to extract thread ID from href
+                    thread_id = None
+                    
+                    try:
+                        href = await thread.get_attribute('href')
+                        if href and '/direct/t/' in href:
+                            thread_id = href.split('/direct/t/')[-1].rstrip('/')
+                    except:
+                        pass
+
+                    # Fallback: try to find href in child elements
+                    if not thread_id:
+                        try:
+                            child_link = await thread.query_selector('a[href*="/direct/t/"]')
+                            if child_link:
+                                href = await child_link.get_attribute('href')
+                                if href and '/direct/t/' in href:
+                                    thread_id = href.split('/direct/t/')[-1].rstrip('/')
+                        except:
+                            pass
+
+                    if not thread_id:
+                        thread_id = f"thread_{i}"
+
+                    # Skip if already processed
+                    if thread_id in processed_ids:
+                        continue
+                    processed_ids.add(thread_id)
+
+                    # Get thread title/name with multiple extraction methods
+                    thread_title = f"Direct {i+1}"
+                    
+                    try:
+                        text = await thread.inner_text()
+                        if text and text.strip():
+                            lines = text.split('\n')
+                            thread_title = lines[0].strip()[:50]
+                    except:
+                        pass
+
+                    # Fallback: try aria-label
+                    if thread_title.startswith("Direct"):
+                        try:
+                            aria_label = await thread.get_attribute('aria-label')
+                            if aria_label:
+                                thread_title = aria_label[:50]
+                        except:
+                            pass
+
                     thread_data = {
-                        'id': str(i),
-                        'thread_title': await thread.inner_text() if thread else f"Thread {i}"
+                        'id': thread_id,
+                        'thread_title': thread_title
                     }
                     result.append(type('Thread', (), thread_data)())
-                except:
+
+                except Exception as e:
+                    logger.debug(f"Error processing thread: {e}")
                     pass
+
+            logger.info(f"Found {len(result)} threads")
             return result
         except Exception as e:
             logger.error(f"Error getting threads: {e}")
@@ -405,26 +575,102 @@ class InstagramAccount:
 
     async def send_message_async(self, thread_id: str, message: str) -> bool:
         try:
+            # Ensure session is set
+            context = await self._get_browser_context()
+            if self.session_id:
+                await context.add_cookies([{
+                    'name': 'sessionid',
+                    'value': self.session_id,
+                    'domain': '.instagram.com',
+                    'path': '/'
+                }])
+
             page = await self._get_page()
-            await page.goto(f'https://www.instagram.com/direct/t/{thread_id}/', wait_until='networkidle')
+            await page.goto(f'https://www.instagram.com/direct/t/{thread_id}/', wait_until='domcontentloaded', timeout=30000)
             await asyncio.sleep(2)
 
-            message_input = await page.query_selector('textarea[placeholder*="Message"]')
-            if not message_input:
-                message_input = await page.query_selector('div[role="textbox"]')
+            # Check if redirected to login
+            if 'accounts/login' in page.url:
+                logger.error("Not logged in - redirected to login page")
+                return False
+
+            # Try multiple selectors for message input with comprehensive coverage
+            message_input = None
+            selectors = [
+                # Modern Instagram UI selectors
+                'div[contenteditable="true"][role="textbox"]',
+                'div[aria-label="Message"][contenteditable="true"]',
+                'textarea[aria-label*="Message"]',
+                'textarea[placeholder*="Message"]',
+                # Alternative selectors
+                'p[class*="xdj266r"][contenteditable="true"]',
+                'div[class*="x1iyjqo2"][contenteditable="true"]',
+                'input[aria-label*="Message"]',
+                # Fallback by role
+                'div[role="textbox"]'
+            ]
+
+            for selector in selectors:
+                try:
+                    elements = await page.query_selector_all(selector)
+                    for element in elements:
+                        try:
+                            is_visible = await element.is_visible(timeout=1000)
+                            if is_visible:
+                                message_input = page.locator(selector).first
+                                break
+                        except:
+                            continue
+                    if message_input:
+                        break
+                except:
+                    continue
 
             if message_input:
+                await message_input.click(timeout=5000)
+                await asyncio.sleep(0.3)
                 await message_input.fill(message)
                 await asyncio.sleep(0.5)
 
-                send_button = await page.query_selector('button:has-text("Send")')
-                if send_button:
-                    await send_button.click()
-                else:
+                # Try to find and click send button with comprehensive selectors
+                send_selectors = [
+                    'button[aria-label*="Send"]',
+                    'div[role="button"][aria-label*="Send"]',
+                    'svg[aria-label*="Send"]',
+                    'button:has-text("Send")',
+                    'div[class*="x1ejq31n"]:has-text("Send")',  # Button class
+                    'a[role="button"]:has-text("Send")',
+                ]
+
+                sent = False
+                for sel in send_selectors:
+                    try:
+                        send_btns = await page.query_selector_all(sel)
+                        for send_btn_el in send_btns:
+                            try:
+                                is_visible = await send_btn_el.is_visible(timeout=500)
+                                is_enabled = await send_btn_el.is_enabled(timeout=500)
+                                if is_visible and is_enabled:
+                                    await send_btn_el.click(timeout=5000)
+                                    sent = True
+                                    break
+                            except:
+                                continue
+                        if sent:
+                            break
+                    except:
+                        continue
+
+                if not sent:
+                    # Fallback to keyboard shortcut
+                    await asyncio.sleep(0.2)
                     await page.keyboard.press('Enter')
 
-                await asyncio.sleep(1)
+                await asyncio.sleep(1.5)
+                logger.info(f"Message sent to thread {thread_id}")
                 return True
+
+            logger.error("Could not find message input")
             return False
         except Exception as e:
             logger.error(f"Send message error: {e}")
@@ -440,31 +686,143 @@ class InstagramAccount:
     async def change_thread_title_async(self, thread_id: str, title: str) -> bool:
         try:
             page = await self._get_page()
-            await page.goto(f'https://www.instagram.com/direct/t/{thread_id}/', wait_until='domcontentloaded', timeout=600000)
-            
-            gear_icon = page.locator('svg[aria-label="Conversation information"]')
-            await gear_icon.wait_for(timeout=160000)
-            await gear_icon.click()
-            await asyncio.sleep(1)
-            
-            change_btn = page.locator('div[aria-label="Change group name"][role="button"]')
-            group_input = page.locator('input[aria-label="Group name"][name="change-group-name"]')
-            save_btn = page.locator('div[role="button"]:has-text("Save")')
-            
-            await change_btn.click()
-            await group_input.click(click_count=3)
-            await group_input.fill(title)
-            
-            disabled = await save_btn.get_attribute("aria-disabled")
-            if disabled == "true":
-                logger.warning(f"Save button disabled for thread {thread_id}")
+            await page.goto(f'https://www.instagram.com/direct/t/{thread_id}/', wait_until='domcontentloaded', timeout=30000)
+            await asyncio.sleep(1.5)
+
+            # Find and click conversation info button with multiple fallbacks
+            gear_selectors = [
+                'svg[aria-label="Conversation information"]',
+                'button[aria-label*="Conversation"]',
+                'div[role="button"][aria-label*="Conversation"]',
+                'svg[aria-label*="info"]',
+                'button:has-text("info")',
+                'div[class*="x1iyjqo2"]:has(svg[aria-label*="Conversation"])',
+            ]
+
+            gear_icon = None
+            for sel in gear_selectors:
+                try:
+                    elements = await page.query_selector_all(sel)
+                    if elements:
+                        for elem in elements:
+                            try:
+                                is_visible = await elem.is_visible(timeout=500)
+                                if is_visible:
+                                    gear_icon = elem
+                                    break
+                            except:
+                                continue
+                        if gear_icon:
+                            break
+                except:
+                    continue
+
+            if not gear_icon:
+                logger.error(f"Could not find gear icon for thread {thread_id}")
                 return False
-            
-            await save_btn.click()
-            await asyncio.sleep(0.5)
-            logger.info(f"Playwright: Changed thread {thread_id} title to '{title}'")
-            return True
-            
+
+            await gear_icon.click(timeout=5000)
+            await asyncio.sleep(1)
+
+            # Find change name button with fallbacks
+            change_selectors = [
+                'div[aria-label="Change group name"][role="button"]',
+                'button:has-text("Change group name")',
+                'div[role="button"]:has-text("Change")',
+                'div[class*="x1iyjqo2"]:has-text("Change")',
+            ]
+
+            change_btn = None
+            for sel in change_selectors:
+                try:
+                    elements = await page.query_selector_all(sel)
+                    if elements:
+                        for elem in elements:
+                            try:
+                                is_visible = await elem.is_visible(timeout=500)
+                                if is_visible:
+                                    change_btn = elem
+                                    break
+                            except:
+                                continue
+                        if change_btn:
+                            break
+                except:
+                    continue
+
+            if change_btn:
+                await change_btn.click(timeout=5000)
+                await asyncio.sleep(0.5)
+
+            # Find group name input with fallbacks
+            input_selectors = [
+                'input[aria-label="Group name"][name="change-group-name"]',
+                'input[aria-label="Group name"]',
+                'input[name="change-group-name"]',
+                'input[placeholder*="Group"]',
+                'input[type="text"]',
+            ]
+
+            group_input = None
+            for sel in input_selectors:
+                try:
+                    elements = await page.query_selector_all(sel)
+                    if elements:
+                        for elem in elements:
+                            try:
+                                is_visible = await elem.is_visible(timeout=500)
+                                if is_visible:
+                                    group_input = elem
+                                    break
+                            except:
+                                continue
+                        if group_input:
+                            break
+                except:
+                    continue
+
+            if group_input:
+                await group_input.click(click_count=3, timeout=5000)
+                await asyncio.sleep(0.2)
+                await group_input.fill(title)
+                await asyncio.sleep(0.5)
+
+            # Find save button with fallbacks
+            save_selectors = [
+                'div[role="button"]:has-text("Save")',
+                'button:has-text("Save")',
+                'div[class*="x1ejq31n"]:has-text("Save")',
+                'a[role="button"]:has-text("Save")',
+            ]
+
+            save_btn = None
+            for sel in save_selectors:
+                try:
+                    elements = await page.query_selector_all(sel)
+                    if elements:
+                        for elem in elements:
+                            try:
+                                is_visible = await elem.is_visible(timeout=500)
+                                is_enabled = await elem.is_enabled(timeout=500)
+                                if is_visible and is_enabled:
+                                    save_btn = elem
+                                    break
+                            except:
+                                continue
+                        if save_btn:
+                            break
+                except:
+                    continue
+
+            if save_btn:
+                await save_btn.click(timeout=5000)
+                await asyncio.sleep(1)
+                logger.info(f"Playwright: Changed thread {thread_id} title to '{title}'")
+                return True
+            else:
+                logger.warning(f"Could not find save button for thread {thread_id}")
+                return False
+
         except Exception as e:
             logger.error(f"Change title error: {e}")
             return False
@@ -483,38 +841,183 @@ class InstagramAccount:
             options.add_argument("--disable-dev-shm-usage")
             options.add_argument("--disable-gpu")
             options.add_argument("--headless")
+            options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
             driver = webdriver.Chrome(options=options)
             try:
+                # First load Instagram to set cookies
+                driver.get('https://www.instagram.com/')
+                time.sleep(1)
+
+                # Add session cookie - CRITICAL FIX
+                session_id = self.get_session_id()
+                if session_id:
+                    driver.add_cookie({
+                        'name': 'sessionid',
+                        'value': session_id,
+                        'domain': '.instagram.com',
+                        'path': '/',
+                        'secure': True,
+                        'httpOnly': True,
+                        'sameSite': 'None'
+                    })
+                else:
+                    logger.error("Selenium: No session ID available")
+                    return False
+
+                # Now navigate to the thread
                 driver.get(f'https://www.instagram.com/direct/t/{thread_id}/')
                 time.sleep(3)
 
-                details_button = WebDriverWait(driver, 10).until(
-                    EC.presence_of_element_located((By.XPATH, '//button[contains(@aria-label, "Details")]'))
-                )
-                details_button.click()
-                time.sleep(1)
+                # Multiple XPath strategies for conversation info button
+                info_xpaths = [
+                    '//svg[@aria-label="Conversation information"]',
+                    '//*[@aria-label="Conversation information"]',
+                    '//button[contains(@aria-label, "Conversation")]',
+                    '//div[contains(@aria-label, "Conversation")]',
+                    '//svg[contains(@aria-label, "info")]',
+                ]
 
-                title_input = WebDriverWait(driver, 10).until(
-                    EC.presence_of_element_located((By.XPATH, '//input[contains(@placeholder, "name")]'))
-                )
-                title_input.clear()
-                title_input.send_keys(title)
-                title_input.send_keys(Keys.ENTER)
-                time.sleep(1)
-                logger.info(f"Selenium: Changed thread {thread_id} title to '{title}'")
-                return True
+                details_button = None
+                for xpath in info_xpaths:
+                    try:
+                        details_button = WebDriverWait(driver, 5).until(
+                            EC.presence_of_element_located((By.XPATH, xpath))
+                        )
+                        if details_button:
+                            break
+                    except:
+                        continue
+
+                if details_button:
+                    details_button.click()
+                    time.sleep(1)
+                else:
+                    logger.error("Could not find conversation info button")
+                    return False
+
+                # Multiple XPath strategies for change name button
+                change_xpaths = [
+                    '//*[@aria-label="Change group name"]',
+                    '//div[@aria-label="Change group name"]',
+                    '//*[contains(text(), "Change group name")]',
+                    '//*[contains(text(), "Change")]',
+                ]
+
+                change_name_btn = None
+                for xpath in change_xpaths:
+                    try:
+                        change_name_btn = WebDriverWait(driver, 5).until(
+                            EC.presence_of_element_located((By.XPATH, xpath))
+                        )
+                        if change_name_btn:
+                            break
+                    except:
+                        continue
+
+                if change_name_btn:
+                    change_name_btn.click()
+                    time.sleep(0.5)
+
+                # Multiple XPath strategies for input field
+                input_xpaths = [
+                    '//input[@name="change-group-name"]',
+                    '//input[@aria-label="Group name"]',
+                    '//input[contains(@placeholder, "Group")]',
+                    '//input[contains(@aria-label, "Group")]',
+                ]
+
+                title_input = None
+                for xpath in input_xpaths:
+                    try:
+                        title_input = WebDriverWait(driver, 5).until(
+                            EC.presence_of_element_located((By.XPATH, xpath))
+                        )
+                        if title_input:
+                            break
+                    except:
+                        continue
+
+                if title_input:
+                    title_input.click()
+                    time.sleep(0.2)
+                    title_input.send_keys(Keys.CONTROL + "a")
+                    title_input.send_keys(title)
+                    time.sleep(0.5)
+
+                # Multiple XPath strategies for save button
+                save_xpaths = [
+                    '//div[contains(text(), "Save")][@role="button"]',
+                    '//button[contains(text(), "Save")]',
+                    '//*[contains(text(), "Save")]',
+                    '//div[text()="Save"]',
+                ]
+
+                save_btn = None
+                for xpath in save_xpaths:
+                    try:
+                        save_btn = WebDriverWait(driver, 5).until(
+                            EC.element_to_be_clickable((By.XPATH, xpath))
+                        )
+                        if save_btn:
+                            break
+                    except:
+                        continue
+
+                if save_btn:
+                    save_btn.click()
+                    time.sleep(1.5)
+                    logger.info(f"Selenium: Changed thread {thread_id} title to '{title}'")
+                    return True
+                else:
+                    logger.warning(f"Could not find save button for thread {thread_id}")
+                    return False
+
             except Exception as e:
                 logger.error(f"Selenium change title error: {e}")
                 return False
             finally:
-                driver.quit()
+                try:
+                    driver.quit()
+                except:
+                    pass
         except Exception as e:
             logger.error(f"Selenium initialization error: {e}")
             return False
 
-    def change_thread_title_with_fallback(self, thread_id: str, title: str) -> bool:
+    async def change_thread_title_with_fallback_async(self, thread_id: str, title: str) -> bool:
+        """Async version of change_thread_title_with_fallback - use this from async handlers"""
         logger.info(f"Attempting to change thread {thread_id} title to '{title}'...")
-        
+
+        try:
+            logger.info("Trying Playwright method...")
+            result = await self.change_thread_title_async(thread_id, title)
+            if result:
+                logger.info("✅ Playwright method succeeded")
+                return True
+            else:
+                logger.warning("Playwright method failed, falling back to Selenium...")
+        except Exception as e:
+            logger.warning(f"Playwright method exception: {e}, falling back to Selenium...")
+
+        try:
+            logger.info("Trying Selenium method...")
+            # Run Selenium in thread pool to avoid blocking
+            loop = asyncio.get_event_loop()
+            result = await loop.run_in_executor(None, self.change_thread_title_selenium, thread_id, title)
+            if result:
+                logger.info("✅ Selenium method succeeded")
+                return True
+            else:
+                logger.error("Both methods failed")
+                return False
+        except Exception as e:
+            logger.error(f"Selenium method exception: {e}")
+            return False
+
+    def change_thread_title_with_fallback(self, thread_id: str, title: str) -> bool:
+        """Sync version - use change_thread_title_with_fallback_async from async handlers"""
+        logger.info(f"Attempting to change thread {thread_id} title to '{title}'...")
+
         try:
             logger.info("Trying Playwright method...")
             result = self.change_thread_title(thread_id, title)
@@ -525,7 +1028,7 @@ class InstagramAccount:
                 logger.warning("Playwright method failed, falling back to Selenium...")
         except Exception as e:
             logger.warning(f"Playwright method exception: {e}, falling back to Selenium...")
-        
+
         try:
             logger.info("Trying Selenium method...")
             result = self.change_thread_title_selenium(thread_id, title)
@@ -1062,7 +1565,7 @@ async def login_password(update: Update, context: ContextTypes.DEFAULT_TYPE):
             account = InstagramAccount(username, password, user_data.accounts_dir)
             session_id = result.get("session_id")
             if session_id:
-                success, _ = account.login_with_session_id(session_id)
+                success, _ = await account.login_with_session_id_async(session_id)
                 if success:
                     user_data.add_account(username, account)
                     await msg.edit_text(f"✅ Logged in as @{username} via Mobile API!")
@@ -1108,7 +1611,7 @@ async def login_password(update: Update, context: ContextTypes.DEFAULT_TYPE):
     account = InstagramAccount(username, password, user_data.accounts_dir)
     pending_logins[user_id] = {'username': username, 'password': password, 'account': account}
 
-    success, message = account.login()
+    success, message = await account.login_async()
 
     if success:
         user_data.add_account(username, account)
@@ -1194,7 +1697,7 @@ async def login_otp(update: Update, context: ContextTypes.DEFAULT_TYPE):
             account = InstagramAccount(actual_username, password, user_data.accounts_dir)
             session_id = result.get("session_id")
             if session_id:
-                success, _ = account.login_with_session_id(session_id)
+                success, _ = await account.login_with_session_id_async(session_id)
                 if success:
                     user_data.add_account(actual_username, account)
             await msg.edit_text(f"✅ Logged in as @{actual_username}!")
@@ -1219,7 +1722,7 @@ async def login_otp(update: Update, context: ContextTypes.DEFAULT_TYPE):
         del pending_logins[user_id]
         return ConversationHandler.END
 
-    success, message = account.login_with_otp(otp)
+    success, message = await account.login_with_otp_async(otp)
 
     if success:
         user_data = get_user_data(user_id)
@@ -1247,7 +1750,7 @@ async def login_session_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_data = get_user_data(user_id)
 
     temp_account = InstagramAccount("temp_session", "", user_data.accounts_dir)
-    success, message = temp_account.login_with_session_id(session_id)
+    success, message = await temp_account.login_with_session_id_async(session_id)
 
     if success and temp_account.session_id:
         actual_username = temp_account.username if temp_account.username != "temp_session" else "session_user"
@@ -1472,7 +1975,7 @@ async def attack_account(update: Update, context: ContextTypes.DEFAULT_TYPE):
             account = user_data.accounts[username]
 
             msg = await update.message.reply_text("🔄 Loading chats...")
-            threads_list = account.get_direct_threads(10)
+            threads_list = await account.get_direct_threads_async(10)
 
             if not threads_list:
                 await msg.edit_text("❌ No chats found.")
@@ -1618,7 +2121,7 @@ async def nc_account(update: Update, context: ContextTypes.DEFAULT_TYPE):
             account = user_data.accounts[username]
 
             msg = await update.message.reply_text("🔄 Loading chats...")
-            threads_list = account.get_direct_threads(10)
+            threads_list = await account.get_direct_threads_async(10)
 
             if not threads_list:
                 await msg.edit_text("❌ No chats found.")
