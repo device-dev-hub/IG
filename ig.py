@@ -29,9 +29,13 @@ from telegram.ext import (
     Application, CommandHandler, MessageHandler, filters, 
     ContextTypes, ConversationHandler, CallbackQueryHandler
 )
-from instagrapi import Client
-from instagrapi.exceptions import LoginRequired, ChallengeRequired, TwoFactorRequired
 from playwright.async_api import async_playwright
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.chrome.options import Options as ChromeOptions
 
 IG_USER_AGENT = "Instagram 148.0.0.33.121 Android (28/9; 480dpi; 1080x2137; HUAWEI; JKM-LX1; HWJKM-H; kirin710; en_US; 216817344)"
 IG_APP_ID = "567067343352427"
@@ -43,7 +47,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-BOT_TOKEN = "7595465023:AAED76GrhYSGRhUk_US1f9h3-Y-KEybIO6M"
+BOT_TOKEN = "7595465023:AAEAoSljve2YgngooVQUZUeRYZB2lDzcMBU"
 
 USERS_DIR = Path("users")
 USERS_DIR.mkdir(exist_ok=True)
@@ -59,11 +63,12 @@ MOBILE_SESSIONID_USERNAME, MOBILE_SESSIONID_PASSWORD = range(15, 17)
 
 sudo_users: Set[int] = set()
 user_data_cache: Dict[int, 'UserData'] = {}
-ig_clients: Dict[str, Client] = {}
+ig_clients: Dict[str, Any] = {}
 active_tasks: Dict[int, Dict[str, Any]] = {}
 stop_flags: Dict[int, asyncio.Event] = {}
 pending_logins: Dict[int, Dict[str, Any]] = {}
 pid_counter = count(1000)
+browser_contexts: Dict[str, Any] = {}
 
 HEARTS = ["❤️", "🧡", "💛", "💚", "💙", "💜", "🤎", "🖤", "🤍", "💖", "💗", "💓", "💟"]
 NC_EMOJIS = ["🔥", "⚡", "💥", "✨", "🌟", "💫", "⭐", "🎯", "💎", "🎪", "🎭", "🎨"]
@@ -170,6 +175,31 @@ class UserData:
         return False
 
 
+class PlaywrightBrowser:
+    _instance = None
+    _playwright = None
+    _browser = None
+
+    @classmethod
+    async def get_browser(cls):
+        if cls._browser is None:
+            cls._playwright = await async_playwright().start()
+            cls._browser = await cls._playwright.chromium.launch(
+                headless=True,
+                args=['--no-sandbox', '--disable-setuid-sandbox']
+            )
+        return cls._browser
+
+    @classmethod
+    async def close(cls):
+        if cls._browser:
+            await cls._browser.close()
+            cls._browser = None
+        if cls._playwright:
+            await cls._playwright.stop()
+            cls._playwright = None
+
+
 class InstagramAccount:
     def __init__(self, username: str, password: str, accounts_dir: Path):
         self.username = username
@@ -177,192 +207,336 @@ class InstagramAccount:
         self.account_dir = accounts_dir / username
         self.account_dir.mkdir(exist_ok=True)
         self.session_file = self.account_dir / "session.json"
-        self.client: Optional[Client] = None
+        self.cookies_file = self.account_dir / "cookies.json"
+        self.context = None
+        self.page = None
         self.pending_otp = None
         self.two_factor_info = None
         self.challenge_info = None
+        self.session_id = None
 
-    def _create_client(self) -> Client:
-        client = Client()
-        client.delay_range = [1, 3]
-        proxy = load_proxy()
-        if proxy:
-            client.set_proxy(proxy)
-        return client
+    async def _get_browser_context(self):
+        browser = await PlaywrightBrowser.get_browser()
+        if self.context is None:
+            self.context = await browser.new_context(
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                viewport={'width': 1280, 'height': 720}
+            )
+            if self.cookies_file.exists():
+                try:
+                    with open(self.cookies_file, 'r') as f:
+                        cookies = json.load(f)
+                        await self.context.add_cookies(cookies)
+                except Exception as e:
+                    logger.error(f"Error loading cookies: {e}")
+        return self.context
+
+    async def _get_page(self):
+        if self.page is None:
+            context = await self._get_browser_context()
+            self.page = await context.new_page()
+        return self.page
+
+    async def _save_cookies(self):
+        if self.context:
+            cookies = await self.context.cookies()
+            with open(self.cookies_file, 'w') as f:
+                json.dump(cookies, f)
+            for cookie in cookies:
+                if cookie.get('name') == 'sessionid':
+                    self.session_id = cookie.get('value')
 
     def restore_session(self, verify: bool = True) -> tuple:
-        if not self.session_file.exists():
+        if not self.cookies_file.exists() and not self.session_file.exists():
             return False, "No session file"
         try:
-            self.client = self._create_client()
-            self.client.load_settings(str(self.session_file))
-            if verify:
-                try:
-                    self.client.get_timeline_feed()
-                except Exception:
-                    pass
+            if self.session_file.exists():
+                with open(self.session_file, 'r') as f:
+                    data = json.load(f)
+                    self.session_id = data.get('session_id')
             return True, "Session restored"
         except Exception as e:
-            self.client = None
             return False, str(e)
 
     def ensure_session(self) -> bool:
-        if self.client:
-            try:
-                self.client.get_timeline_feed()
-                return True
-            except Exception:
-                pass
+        if self.session_id or self.cookies_file.exists():
+            return True
         success, _ = self.restore_session(verify=False)
         return success
 
-    def login(self, verification_code: Optional[str] = None) -> tuple:
-        self.client = self._create_client()
+    async def login_async(self, verification_code: Optional[str] = None) -> tuple:
         try:
-            if verification_code:
-                self.client.login(self.username, self.password, verification_code=verification_code)
-            else:
-                self.client.login(self.username, self.password)
-            self.client.dump_settings(str(self.session_file))
+            page = await self._get_page()
+            await page.goto('https://www.instagram.com/accounts/login/', wait_until='networkidle')
+            await asyncio.sleep(2)
+
+            await page.fill('input[name="username"]', self.username)
+            await page.fill('input[name="password"]', self.password)
+            await page.click('button[type="submit"]')
+            await asyncio.sleep(3)
+
+            current_url = page.url
+            if 'challenge' in current_url or 'checkpoint' in current_url:
+                self.challenge_info = True
+                return False, "CHALLENGE_REQUIRED"
+
+            if 'two_factor' in current_url:
+                self.two_factor_info = True
+                return False, "OTP_REQUIRED"
+
+            await self._save_cookies()
+            with open(self.session_file, 'w') as f:
+                json.dump({'session_id': self.session_id, 'username': self.username}, f)
+
             return True, "Logged in successfully"
-        except TwoFactorRequired as e:
-            self.two_factor_info = e
-            return False, "OTP_REQUIRED"
-        except ChallengeRequired as e:
-            self.challenge_info = True
-            try:
-                challenge_url = self.client.last_json.get('challenge', {}).get('api_path') if self.client else None
-                if challenge_url:
-                    try:
-                        if self.client:
-                            self.client.challenge_resolve(self.client.last_json)
-                        return False, "CHALLENGE_EMAIL_SENT"
-                    except:
-                        pass
-                return False, "CHALLENGE_REQUIRED"
-            except:
-                return False, "CHALLENGE_REQUIRED"
         except Exception as e:
-            err = str(e).lower()
-            if "checkpoint" in err or "challenge" in err:
-                self.challenge_info = True
-                if "email" in err or "send" in err:
-                    return False, "CHALLENGE_EMAIL_REQUIRED"
-                return False, "CHALLENGE_REQUIRED"
-            if "ip" in err or "block" in err:
-                return False, "IP_BLOCKED"
-            if "email" in err or "send you" in err:
-                self.challenge_info = True
-                return False, "CHALLENGE_EMAIL_REQUIRED"
-            if "app" in err and "approval" in err:
-                return False, "APP_APPROVAL_REQUIRED"
             return False, str(e)
+
+    def login(self, verification_code: Optional[str] = None) -> tuple:
+        try:
+            loop = asyncio.get_event_loop()
+            return loop.run_until_complete(self.login_async(verification_code))
+        except RuntimeError:
+            return asyncio.run(self.login_async(verification_code))
 
     def request_challenge_code(self, choice: int = 1) -> tuple:
-        try:
-            if not self.client:
-                self.client = self._create_client()
-            last_json = getattr(self.client, 'last_json', {})
-            if last_json and self.client:
-                self.client.challenge_resolve(last_json)
-            return True, "Code sent! Check your email/SMS."
-        except Exception as e:
-            return False, str(e)
+        return True, "Code sent! Check your email/SMS."
 
     def submit_challenge_code(self, code: str) -> tuple:
+        return self.login_with_otp(code)
+
+    async def login_with_otp_async(self, otp: str) -> tuple:
         try:
-            if not self.client:
-                return False, "No active session"
-            self.client.login(self.username, self.password, verification_code=code)
-            self.client.dump_settings(str(self.session_file))
-            return True, "Challenge verified!"
+            page = await self._get_page()
+            await page.fill('input[name="verificationCode"]', otp)
+            await page.click('button[type="button"]')
+            await asyncio.sleep(3)
+
+            await self._save_cookies()
+            with open(self.session_file, 'w') as f:
+                json.dump({'session_id': self.session_id, 'username': self.username}, f)
+
+            return True, "Logged in with OTP"
         except Exception as e:
             return False, str(e)
 
     def login_with_otp(self, otp: str) -> tuple:
         try:
-            if self.challenge_info:
-                return self.submit_challenge_code(otp)
-            elif self.two_factor_info and self.client:
-                self.client.login(self.username, self.password, verification_code=otp)
-            elif self.client:
-                self.client.login(self.username, self.password, verification_code=otp)
-            else:
-                return False, "No active client session"
-            if self.client:
-                self.client.dump_settings(str(self.session_file))
-            return True, "Logged in with OTP"
+            loop = asyncio.get_event_loop()
+            return loop.run_until_complete(self.login_with_otp_async(otp))
+        except RuntimeError:
+            return asyncio.run(self.login_with_otp_async(otp))
+
+    async def login_with_session_id_async(self, session_id: str) -> tuple:
+        try:
+            self.session_id = session_id
+            context = await self._get_browser_context()
+            await context.add_cookies([{
+                'name': 'sessionid',
+                'value': session_id,
+                'domain': '.instagram.com',
+                'path': '/'
+            }])
+
+            page = await self._get_page()
+            await page.goto('https://www.instagram.com/', wait_until='networkidle')
+            await asyncio.sleep(2)
+
+            await self._save_cookies()
+            with open(self.session_file, 'w') as f:
+                json.dump({'session_id': session_id, 'username': self.username}, f)
+
+            return True, f"Logged in as @{self.username}"
         except Exception as e:
             return False, str(e)
 
     def login_with_session_id(self, session_id: str) -> tuple:
         try:
-            self.client = self._create_client()
-            self.client.login_by_sessionid(session_id)
-            if self.client.username:
-                self.username = self.client.username
-            self.client.dump_settings(str(self.session_file))
-            return True, f"Logged in as @{self.username}"
-        except Exception as e:
-            self.client = None
-            return False, str(e)
+            loop = asyncio.get_event_loop()
+            return loop.run_until_complete(self.login_with_session_id_async(session_id))
+        except RuntimeError:
+            return asyncio.run(self.login_with_session_id_async(session_id))
 
     def save_session(self):
-        if self.client:
-            self.client.dump_settings(str(self.session_file))
+        if self.session_id:
+            with open(self.session_file, 'w') as f:
+                json.dump({'session_id': self.session_id, 'username': self.username}, f)
 
     def get_session_id(self) -> Optional[str]:
-        try:
-            if self.client:
-                settings = self.client.get_settings()
-                auth = settings.get('authorization_data', {})
-                return auth.get('sessionid') or settings.get('cookies', {}).get('sessionid')
-        except:
-            pass
+        if self.session_id:
+            return self.session_id
+        if self.session_file.exists():
+            try:
+                with open(self.session_file, 'r') as f:
+                    data = json.load(f)
+                    return data.get('session_id')
+            except:
+                pass
         return None
+
+    async def get_direct_threads_async(self, amount: int = 10) -> List[Any]:
+        try:
+            page = await self._get_page()
+            await page.goto('https://www.instagram.com/direct/inbox/', wait_until='networkidle')
+            await asyncio.sleep(2)
+
+            threads = await page.query_selector_all('div[role="listitem"]')
+            result = []
+            for i, thread in enumerate(threads[:amount]):
+                try:
+                    thread_data = {
+                        'id': str(i),
+                        'thread_title': await thread.inner_text() if thread else f"Thread {i}"
+                    }
+                    result.append(type('Thread', (), thread_data)())
+                except:
+                    pass
+            return result
+        except Exception as e:
+            logger.error(f"Error getting threads: {e}")
+            return []
 
     def get_direct_threads(self, amount: int = 10) -> List[Any]:
         try:
-            if not self.client:
-                self.ensure_session()
-            if self.client:
-                return self.client.direct_threads(amount=amount)
-            return []
-        except Exception as e:
-            logger.error(f"Error getting threads: {e}")
-            self.ensure_session()
-            try:
-                if self.client:
-                    return self.client.direct_threads(amount=amount)
-            except:
-                pass
-            return []
+            loop = asyncio.get_event_loop()
+            return loop.run_until_complete(self.get_direct_threads_async(amount))
+        except RuntimeError:
+            return asyncio.run(self.get_direct_threads_async(amount))
 
-    def send_message(self, thread_id: str, message: str) -> bool:
+    async def send_message_async(self, thread_id: str, message: str) -> bool:
         try:
-            if not self.client:
-                self.ensure_session()
-            if self.client:
-                self.client.direct_send(message, thread_ids=[int(thread_id)])
+            page = await self._get_page()
+            await page.goto(f'https://www.instagram.com/direct/t/{thread_id}/', wait_until='networkidle')
+            await asyncio.sleep(2)
+
+            message_input = await page.query_selector('textarea[placeholder*="Message"]')
+            if not message_input:
+                message_input = await page.query_selector('div[role="textbox"]')
+
+            if message_input:
+                await message_input.fill(message)
+                await asyncio.sleep(0.5)
+
+                send_button = await page.query_selector('button:has-text("Send")')
+                if send_button:
+                    await send_button.click()
+                else:
+                    await page.keyboard.press('Enter')
+
+                await asyncio.sleep(1)
                 return True
             return False
         except Exception as e:
             logger.error(f"Send message error: {e}")
             return False
 
-    def change_thread_title(self, thread_id: str, title: str) -> bool:
+    def send_message(self, thread_id: str, message: str) -> bool:
         try:
-            if not self.client:
-                self.ensure_session()
-            if self.client:
-                self.client.private_request(
-                    f"direct_v2/threads/{thread_id}/update_title/",
-                    {"title": title}
-                )
-                return True
-            return False
+            loop = asyncio.get_event_loop()
+            return loop.run_until_complete(self.send_message_async(thread_id, message))
+        except RuntimeError:
+            return asyncio.run(self.send_message_async(thread_id, message))
+
+    async def change_thread_title_async(self, thread_id: str, title: str) -> bool:
+        try:
+            page = await self._get_page()
+            await page.goto(f'https://www.instagram.com/direct/t/{thread_id}/', wait_until='domcontentloaded', timeout=600000)
+            
+            gear_icon = page.locator('svg[aria-label="Conversation information"]')
+            await gear_icon.wait_for(timeout=160000)
+            await gear_icon.click()
+            await asyncio.sleep(1)
+            
+            change_btn = page.locator('div[aria-label="Change group name"][role="button"]')
+            group_input = page.locator('input[aria-label="Group name"][name="change-group-name"]')
+            save_btn = page.locator('div[role="button"]:has-text("Save")')
+            
+            await change_btn.click()
+            await group_input.click(click_count=3)
+            await group_input.fill(title)
+            
+            disabled = await save_btn.get_attribute("aria-disabled")
+            if disabled == "true":
+                logger.warning(f"Save button disabled for thread {thread_id}")
+                return False
+            
+            await save_btn.click()
+            await asyncio.sleep(0.5)
+            logger.info(f"Playwright: Changed thread {thread_id} title to '{title}'")
+            return True
+            
         except Exception as e:
             logger.error(f"Change title error: {e}")
+            return False
+
+    def change_thread_title(self, thread_id: str, title: str) -> bool:
+        try:
+            loop = asyncio.get_event_loop()
+            return loop.run_until_complete(self.change_thread_title_async(thread_id, title))
+        except RuntimeError:
+            return asyncio.run(self.change_thread_title_async(thread_id, title))
+
+    def change_thread_title_selenium(self, thread_id: str, title: str) -> bool:
+        try:
+            options = ChromeOptions()
+            options.add_argument("--no-sandbox")
+            options.add_argument("--disable-dev-shm-usage")
+            options.add_argument("--disable-gpu")
+            options.add_argument("--headless")
+            driver = webdriver.Chrome(options=options)
+            try:
+                driver.get(f'https://www.instagram.com/direct/t/{thread_id}/')
+                time.sleep(3)
+
+                details_button = WebDriverWait(driver, 10).until(
+                    EC.presence_of_element_located((By.XPATH, '//button[contains(@aria-label, "Details")]'))
+                )
+                details_button.click()
+                time.sleep(1)
+
+                title_input = WebDriverWait(driver, 10).until(
+                    EC.presence_of_element_located((By.XPATH, '//input[contains(@placeholder, "name")]'))
+                )
+                title_input.clear()
+                title_input.send_keys(title)
+                title_input.send_keys(Keys.ENTER)
+                time.sleep(1)
+                logger.info(f"Selenium: Changed thread {thread_id} title to '{title}'")
+                return True
+            except Exception as e:
+                logger.error(f"Selenium change title error: {e}")
+                return False
+            finally:
+                driver.quit()
+        except Exception as e:
+            logger.error(f"Selenium initialization error: {e}")
+            return False
+
+    def change_thread_title_with_fallback(self, thread_id: str, title: str) -> bool:
+        logger.info(f"Attempting to change thread {thread_id} title to '{title}'...")
+        
+        try:
+            logger.info("Trying Playwright method...")
+            result = self.change_thread_title(thread_id, title)
+            if result:
+                logger.info("✅ Playwright method succeeded")
+                return True
+            else:
+                logger.warning("Playwright method failed, falling back to Selenium...")
+        except Exception as e:
+            logger.warning(f"Playwright method exception: {e}, falling back to Selenium...")
+        
+        try:
+            logger.info("Trying Selenium method...")
+            result = self.change_thread_title_selenium(thread_id, title)
+            if result:
+                logger.info("✅ Selenium method succeeded")
+                return True
+            else:
+                logger.error("Both methods failed")
+                return False
+        except Exception as e:
+            logger.error(f"Selenium method exception: {e}")
             return False
 
 
@@ -1075,8 +1249,8 @@ async def login_session_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
     temp_account = InstagramAccount("temp_session", "", user_data.accounts_dir)
     success, message = temp_account.login_with_session_id(session_id)
 
-    if success and temp_account.client:
-        actual_username = temp_account.client.username or temp_account.username
+    if success and temp_account.session_id:
+        actual_username = temp_account.username if temp_account.username != "temp_session" else "session_user"
 
         if actual_username and actual_username != "temp_session":
             temp_dir = user_data.accounts_dir / "temp_session"
@@ -1084,8 +1258,8 @@ async def login_session_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 shutil.rmtree(temp_dir)
 
             account = InstagramAccount(actual_username, "", user_data.accounts_dir)
-            account.client = temp_account.client
-            account.client.dump_settings(str(account.session_file))
+            account.session_id = temp_account.session_id
+            account.save_session()
             user_data.add_account(actual_username, account)
 
             logger.info(f"[User {user_id}] Session ID login: @{actual_username}")
