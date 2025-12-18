@@ -47,7 +47,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-BOT_TOKEN = "7595465023:AAEAoSljve2YgngooVQUZUeRYZB2lDzcMBU"
+BOT_TOKEN = "7595465023:AAHz9L8E_Xl2XD88Abn4jCuSzm_MnoY6Hus"
 
 USERS_DIR = Path("users")
 USERS_DIR.mkdir(exist_ok=True)
