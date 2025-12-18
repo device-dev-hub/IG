@@ -339,8 +339,8 @@ class InstagramAccount:
             }])
 
             page = await self._get_page()
-            await page.goto('https://www.instagram.com/', wait_until='networkidle')
-            await asyncio.sleep(2)
+            await page.goto('https://www.instagram.com/', wait_until='domcontentloaded', timeout=30000)
+            await asyncio.sleep(1)
 
             await self._save_cookies()
             with open(self.session_file, 'w') as f:
